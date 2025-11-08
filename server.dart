@@ -22,25 +22,39 @@ void main(List<String> args) async {
 }
 
 class _SoupServer {
-  // 连接
+  // 连接映射
   final Map<WebSocket, int> _connToId = {};
   final Map<int, WebSocket> _idToConn = {};
 
-  // 全局状态
-  int _nextId = 1;               // 1 号留给主持人（第一个连入者）
+  // —— 全局状态 —— //
+  int _nextId = 1;               // 1 号为主持人（首个连接）
   bool running = false;
   bool waitingOpening = false;
   bool hostOpeningUsed = false;
   int? speakingId;
   int round = 1;
-  List<int> order = [];          // 包含主持人 1
-  bool awaitingVerdict = false;  // 是否等待主持人判定（控制客户端高亮）
+  List<int> order = [];          // 含主持人 1
+  bool awaitingVerdict = false;  // 是否等待主持人判定（高亮）
 
-  // ===== 历史存储（最近 N 条） =====
+  // —— 计分 —— //
+  final Map<int, int> scores = {}; // 玩家积分（id -> total）
+
+  // —— 头像（跨端同步，base64 PNG/JPG）—— //
+  final Map<int, String> avatarsB64 = {}; // id -> base64（不含 dataURI 头）
+
+  // —— 历史（最近 200 条，可调）—— //
   final int _maxHistory = 200;
-  final List<Map<String, dynamic>> _histOrdered = []; // system/opening/chat/verdict
+  final List<Map<String, dynamic>> _histOrdered = []; // system/opening/chat/verdict/score/avatar
   final List<Map<String, dynamic>> _histFree = [];    // freechat
 
+  // ===== 工具：把 int 键的 Map 转成 string 键（供 jsonEncode 使用） =====
+  Map<String, T> _stringKeys<T>(Map<int, T> m) {
+    final out = <String, T>{};
+    m.forEach((k, v) => out['$k'] = v);
+    return out;
+  }
+
+  // 入口：处理新连接
   void handleClient(WebSocket ws) {
     final id = _assignId(ws);
     final isHost = (id == 1);
@@ -52,14 +66,16 @@ class _SoupServer {
       'isHost': isHost,
     });
 
-    // 首次下发历史
+    // 首次下发历史 & 积分 & 头像（注意把 Map<int,...> 的键转成字符串）
     _send(ws, {
       'type': 'bulkSync',
       'ordered': _histOrdered,
       'free': _histFree,
+      'scores': _stringKeys(scores),
+      'avatars': _stringKeys(avatarsB64),
     });
 
-    // 再发一次当前状态
+    // 下发当前状态
     _broadcastState();
 
     ws.listen((data) {
@@ -69,7 +85,6 @@ class _SoupServer {
 
         switch (type) {
           case 'restore':
-            // 客户端请求恢复：回 welcome + 历史 + 状态
             _send(ws, {
               'type': 'welcome',
               'playerId': id,
@@ -79,6 +94,8 @@ class _SoupServer {
               'type': 'bulkSync',
               'ordered': _histOrdered,
               'free': _histFree,
+              'scores': _stringKeys(scores),
+              'avatars': _stringKeys(avatarsB64),
             });
             _broadcastState();
             break;
@@ -102,11 +119,39 @@ class _SoupServer {
               case 'verdict':
                 _onVerdict((msg['verdict'] ?? '').toString());
                 break;
+              case 'score':
+                final to = msg['to'];
+                final delta = msg['delta'];
+                if (to is int && delta is int && delta >= 0 && delta <= 3) {
+                  _applyScore(to, delta);
+                }
+                break;
             }
             break;
 
+          case 'avatar':
+            // 任何玩家都可更新自己的头像；限制体积以防滥用
+            final pngB64 = (msg['pngB64'] ?? '').toString();
+            if (pngB64.isEmpty) break;
+            // 体积限制（base64长度大致等于原始*1.33），这里约 100KB 原图
+            if (pngB64.length > 140000) {
+              print('Avatar too large from id=$id, ignored.');
+              break;
+            }
+            avatarsB64[id] = pngB64;
+            final objAvatar = {
+              'type': 'avatar',
+              'id': id,
+              'pngB64': pngB64,
+              'ts': DateTime.now().toIso8601String(),
+            };
+            _broadcast(objAvatar);
+            _pushOrdered(objAvatar); // 作为事件记录（可选）
+            _broadcastState();       // state 中也包含 avatars
+            break;
+
           case 'chat':
-            // 顺序发言区：仅当前发言观众可说话
+            // 顺序发言：仅当前发言观众可说
             if (!running || waitingOpening) break;
             if (speakingId != id) break;
 
@@ -122,26 +167,24 @@ class _SoupServer {
             _broadcast(objChat);
             _pushOrdered(objChat);
 
-            // 新规则：顺序区发言均视为需要判定
             awaitingVerdict = true;
             _broadcastState();
             break;
 
           case 'freechat':
-            // 自由聊天：主持人不能说，其他人随时可说
+            // 自由聊天：主持人不可发言，其余人随时可发
             if (id == 1) break;
-            final text = (msg['text'] ?? '').toString();
-            if (text.isEmpty) break;
+            final text2 = (msg['text'] ?? '').toString();
+            if (text2.isEmpty) break;
 
             final objFree = {
               'type': 'freechat',
               'from': id,
-              'text': text,
+              'text': text2,
               'ts': DateTime.now().toIso8601String(),
             };
             _broadcast(objFree);
             _pushFree(objFree);
-            // 不影响流程与 awaitingVerdict
             break;
         }
       } catch (e) {
@@ -155,11 +198,13 @@ class _SoupServer {
     });
   }
 
+  // 分配玩家 ID（首个为主持人 1）
   int _assignId(WebSocket ws) {
     if (!_idToConn.containsKey(1)) {
       _connToId[ws] = 1;
       _idToConn[1] = ws;
       if (!order.contains(1)) order.insert(0, 1);
+      scores.putIfAbsent(1, () => 0);
       print('New host connected: id=1');
       return 1;
     }
@@ -170,6 +215,7 @@ class _SoupServer {
     _connToId[ws] = id;
     _idToConn[id] = ws;
     if (!order.contains(id)) order.add(id);
+    scores.putIfAbsent(id, () => 0);
     print('New user connected: id=$id');
     return id;
   }
@@ -179,8 +225,6 @@ class _SoupServer {
     if (id != null) {
       _idToConn.remove(id);
       order.remove(id);
-
-      // 当前发言者掉线则推进
       if (speakingId == id) {
         _advanceSpeaker();
       }
@@ -189,7 +233,7 @@ class _SoupServer {
     _broadcastState();
   }
 
-  // ===== 流程控制 =====
+  // —— 流程控制 —— //
   void _onStart() {
     running = true;
     waitingOpening = true;
@@ -270,7 +314,7 @@ class _SoupServer {
     _broadcast(obj);
     _pushOrdered(obj);
 
-    awaitingVerdict = false; // 关闭高亮
+    awaitingVerdict = false;
     _advanceSpeaker();
     _broadcastState();
   }
@@ -303,7 +347,23 @@ class _SoupServer {
     }
   }
 
-  // ===== 历史存储 =====
+  // —— 计分逻辑 —— //
+  void _applyScore(int to, int delta) {
+    scores[to] = (scores[to] ?? 0) + delta;
+
+    final obj = {
+      'type': 'score',
+      'to': to,
+      'delta': delta,
+      'total': scores[to],
+      'ts': DateTime.now().toIso8601String(),
+    };
+    _broadcast(obj);
+    _pushOrdered(obj);
+    _broadcastState();
+  }
+
+  // —— 历史入库 —— //
   void _pushOrdered(Map<String, dynamic> obj) {
     _histOrdered.add(obj);
     if (_histOrdered.length > _maxHistory) {
@@ -318,7 +378,7 @@ class _SoupServer {
     }
   }
 
-  // ===== 广播/发送 =====
+  // —— 广播/发送 —— //
   void _broadcastState() {
     final payload = {
       'type': 'state',
@@ -329,10 +389,13 @@ class _SoupServer {
       'round': round,
       'order': order,
       'awaitingVerdict': awaitingVerdict,
+      'scores': _stringKeys(scores),     // ★ 键转字符串
+      'avatars': _stringKeys(avatarsB64) // ★ 键转字符串
     };
     print('[STATE] running=$running waitingOpening=$waitingOpening '
-        'speakingId=$speakingId round=$round awaitingVerdict=$awaitingVerdict '
-        'online=${_idToConn.length}');
+        'speakingId=$speakingId round=$round '
+        'awaitingVerdict=$awaitingVerdict online=${_idToConn.length} '
+        'scores=${scores.length} avatars=${avatarsB64.length}');
     _broadcast(payload);
   }
 
