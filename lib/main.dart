@@ -1,3 +1,4 @@
+// main.dart (完整内容)
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -8,6 +9,9 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/html.dart' as html;
 import 'package:file_picker/file_picker.dart';
 import 'package:image/image.dart' as img;
+
+// main.dart (完整内容)
+
 
 void main() => runApp(const MyApp());
 
@@ -47,7 +51,7 @@ class _ChatPageState extends State<ChatPage> {
   // 判定高亮
   bool awaitingVerdict = false;
 
-  // —— 新增：计分 —— //
+  // —— 计分 —— //
   final Map<int, int> scores = {};       // playerId -> total score
   int? lastQuestionUserId;               // 最近一条“顺序区提问”的玩家ID（用于打分目标）
   final Set<int> _scoredThisTurn = {};   // 可选：本题已打分的玩家，避免重复打分（简单去重）
@@ -60,9 +64,12 @@ class _ChatPageState extends State<ChatPage> {
   final TextEditingController _openingCtrl = TextEditingController();
   final ScrollController _scrollOrder = ScrollController();
   final ScrollController _scrollFree  = ScrollController();
+  
+  final TextEditingController _soupGuessCtrl = TextEditingController();
+
 
   // 服务器地址（由左栏端口切换）
-  String wsAddress = 'ws://localhost:8080';
+  String wsAddress = 'ws://localhost:8080/ws/game';
 
   // 左侧：历史端口
   List<int> recentPorts = [];
@@ -166,7 +173,7 @@ class _ChatPageState extends State<ChatPage> {
   void _selectPort(int port) {
     final isSecure = wsAddress.startsWith('wss://');
     final scheme = isSecure ? 'wss' : 'ws';
-    wsAddress = '$scheme://localhost:$port';
+    wsAddress = '$scheme://localhost:$port/ws/game';
     _ch?.sink.close();
     _connect();
     setState(() {});
@@ -202,7 +209,6 @@ class _ChatPageState extends State<ChatPage> {
                 ..clear()
                 ..addAll(free.map((e) => Map<String, dynamic>.from(e)));
 
-              // 兼容服务端同步历史积分
               scores.clear();
               final dynamic ss = map['scores'];
               if (ss is Map) {
@@ -213,7 +219,6 @@ class _ChatPageState extends State<ChatPage> {
                 });
               }
 
-              // 恢复“最近提问者”为顺序区最后一条 chat 的 from（便于主持人掉线恢复后继续打分）
               for (int i = ord.length - 1; i >= 0; i--) {
                 final m = ord[i] as Map<String, dynamic>;
                 if (m['type'] == 'chat' && m['from'] is int) {
@@ -237,7 +242,6 @@ class _ChatPageState extends State<ChatPage> {
               final av = map['awaitingVerdict'];
               awaitingVerdict = (av == true) || (av == 1) || (av == 'true');
 
-              // 兼容服务端在 state 中携带 scores
               final dynamic ss = map['scores'];
               if (ss is Map) {
                 scores.clear();
@@ -256,10 +260,9 @@ class _ChatPageState extends State<ChatPage> {
           case 'opening':
             setState(() {
               messages.add(Map<String, dynamic>.from(map));
-              // 记录最近提问者：顺序区 chat 的 from
               if (map['type'] == 'chat' && map['from'] is int) {
                 lastQuestionUserId = map['from'] as int;
-                _scoredThisTurn.remove(lastQuestionUserId); // 新问题允许再次打分
+                _scoredThisTurn.remove(lastQuestionUserId); 
               }
             });
             _scrollToEnd(_scrollOrder);
@@ -270,23 +273,43 @@ class _ChatPageState extends State<ChatPage> {
             _scrollToEnd(_scrollFree);
             break;
 
-          case 'score': // 服务端广播的打分事件（推荐）
+          case 'score': 
             setState(() {
               final to = map['to'];
               final delta = map['delta'];
-              final total = map['total']; // 若服务端给总分，优先采用
+              final total = map['total']; 
               if (to is int) {
                 if (total is num) {
                   scores[to] = total.toInt();
                 } else if (delta is num) {
                   scores[to] = (scores[to] ?? 0) + delta.toInt();
                 }
-                // 一旦对该提问者打分，清理 pending（避免重复）
                 if (lastQuestionUserId == to) {
                   _scoredThisTurn.add(to);
                 }
               }
             });
+            break;
+
+          case 'game_over':
+            setState(() {
+              final guesser = map['guesserId'];
+              final finalScore = map['finalScore'];
+              if (guesser == myId && finalScore is num) {
+                scores[myId!] = finalScore.toInt();
+              }
+            });
+            _showGameOverDialog(
+              map['correct'] == true,
+              map['feedback']?.toString() ?? '游戏结束。',
+            );
+            break;
+            
+          case 'final_guess_result':
+            _showGuessResultDialog(
+              map['correct'] == true, 
+              map['feedback']?.toString() ?? 'AI 未返回评语。',
+            );
             break;
         }
       }, onDone: _scheduleReconnect, onError: (_) => _scheduleReconnect());
@@ -306,7 +329,7 @@ class _ChatPageState extends State<ChatPage> {
       running && !waitingOpening && myId != null && !isHost && speakingId == myId;
 
   bool get canFreeChat =>
-      myId != null && !isHost; // 自由区：主持人不能说，其他人随时可说
+      myId != null && !isHost; 
 
   void _sendOrderChat() {
     final txt = _ctrlOrder.text.trim();
@@ -332,20 +355,17 @@ class _ChatPageState extends State<ChatPage> {
     _ch?.sink.add(jsonEncode(p));
   }
 
-  // —— 新增：主持人打分 —— //
   void _hostScore(int delta) {
     if (!isHost) return;
     final to = lastQuestionUserId;
     if (to == null) return;
-    if (_scoredThisTurn.contains(to)) return; // 已打过分则不重复
+    if (_scoredThisTurn.contains(to)) return; 
 
-    // 本地先行乐观更新
     setState(() {
       scores[to] = (scores[to] ?? 0) + delta;
       _scoredThisTurn.add(to);
     });
 
-    // 通知服务端
     final p = {'type': 'hostControl', 'action': 'score', 'to': to, 'delta': delta};
     _ch?.sink.add(jsonEncode(p));
   }
@@ -378,10 +398,10 @@ class _ChatPageState extends State<ChatPage> {
     _openingCtrl.dispose();
     _scrollOrder.dispose();
     _scrollFree.dispose();
+    _soupGuessCtrl.dispose(); 
     super.dispose();
   }
 
-  // ====== 左侧栏：房间端口 + 左下角个人区块 ======
   Widget _buildLeftSidebar() {
     final roleLabel = isHost ? '主持人' : (speakingId == myId ? '发言人' : '观众');
     final roleColor = isHost ? Colors.orange : (speakingId == myId ? Colors.blue : Colors.grey);
@@ -495,13 +515,11 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // ====== 中间栏：上“顺序发言区” + 下“自由聊天区” + （下方）积分展示 ======
   Widget _buildCenterColumn() {
     return Container(
       padding: const EdgeInsets.all(12),
       child: Column(
         children: [
-          // 顶部状态行
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -517,24 +535,16 @@ class _ChatPageState extends State<ChatPage> {
           ),
           const SizedBox(height: 12),
 
-          // —— 顺序发言区 ——（保持原逻辑）
           _buildOrderedChatPanel(),
-
           const SizedBox(height: 12),
-
-          // —— 自由聊天区 ——（主持人不可发言，其他人随时可发言）
           _buildFreeChatPanel(),
-
           const SizedBox(height: 10),
-
-          // —— 中心积分展示 ——（主持人看全体；玩家看自己）
           _buildScoreBoard(),
         ],
       ),
     );
   }
 
-  // 顺序发言区（原逻辑）
   Widget _buildOrderedChatPanel() {
     return Container(
       decoration: BoxDecoration(
@@ -589,7 +599,6 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // 自由聊天区
   Widget _buildFreeChatPanel() {
     final hint = isHost ? '主持人不可在自由区发言' : '自由聊天…（无需按顺序）';
     return Container(
@@ -651,10 +660,10 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // —— 中央积分展示 —— //
+  // [!! 修改 !!]
+  // 增加了对分数 >= 3 的判断
   Widget _buildScoreBoard() {
     if (isHost) {
-      // 主持人：显示所有玩家积分（按ID升序）
       final ids = List<int>.from(order)..sort();
       return Center(
         child: Wrap(
@@ -668,18 +677,49 @@ class _ChatPageState extends State<ChatPage> {
         ),
       );
     } else {
-      // 普通玩家：只显示自己积分
-      final val = scores[myId ?? -1] ?? 0;
+      // --- 玩家侧 ---
+      final myScore = scores[myId ?? -1] ?? 0;
+      
+      // [!! 新增 !!] 判断是否可推测
+      final bool canGuess = running && (myScore >= 3);
+      
+      // [!! 新增 !!] 根据状态决定按钮文本
+      final String buttonText;
+      if (!running) {
+        buttonText = '推测汤底'; // 游戏未开始，按钮反正也是禁用的
+      } else if (myScore < 3) {
+        buttonText = '推测 (需 3 分)'; // 游戏进行中，但分数不够
+      } else {
+        buttonText = '推测汤底 (-3 分)'; // 游戏进行中，且分数足够
+      }
+
       return Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          decoration: BoxDecoration(
-            color: Colors.blue.withValues(alpha: 0.08),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(color: Colors.blue.withValues(alpha: 0.35)),
-          ),
-          child: Text('我的积分：$val',
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.blue)),
+        child: Column( 
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.blue.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: Colors.blue.withValues(alpha: 0.35)),
+              ),
+              child: Text('我的积分：$myScore',
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.blue)),
+            ),
+            const SizedBox(height: 10), 
+            ElevatedButton.icon(
+              // [!! 修改 !!] 
+              // 只有 canGuess (running 且 score >= 3) 时才可点击
+              onPressed: canGuess ? _showGuessSoupDialog : null, 
+              icon: const Icon(Icons.psychology),
+              label: Text(buttonText), // [!! 修改 !!] 使用动态文本
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber,
+                foregroundColor: Colors.black,
+              ),
+            ),
+          ],
         ),
       );
     }
@@ -695,9 +735,103 @@ class _ChatPageState extends State<ChatPage> {
       ),
       child: Text(text, style: const TextStyle(fontWeight: FontWeight.w600)),
     );
-    }
+  }
 
-  // ====== 右侧栏：发言顺序 + 开场区 + 在线玩家 + 底部按钮（含打分区） ======
+  // 弹窗逻辑不变 (UI 上已做了限制，服务器会做最终校验)
+  void _showGuessSoupDialog() {
+    _soupGuessCtrl.clear();
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('推测汤底 (将消耗 3 分)'), // 提示
+        content: TextField(
+          controller: _soupGuessCtrl,
+          decoration: const InputDecoration(
+            hintText: '请输入你推测的完整汤底…',
+            border: OutlineInputBorder(),
+          ),
+          maxLines: 3,
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
+          ElevatedButton(
+            onPressed: () {
+              final guess = _soupGuessCtrl.text.trim();
+              if (guess.isEmpty) return;
+              Navigator.pop(context); 
+              
+              _ch?.sink.add(jsonEncode({'type': 'final_guess', 'text': guess}));
+              
+              showDialog(
+                context: context,
+                barrierDismissible: false,
+                builder: (_) => const AlertDialog(
+                  title: Text('正在提交...'),
+                  content: Row(children: [CircularProgressIndicator(), SizedBox(width: 16), Text('AI 正在验证您的答案...')]),
+                ),
+              );
+            },
+            child: const Text('提交 (-3 分)'), // 提示
+          ),
+        ],
+      ),
+    );
+  }
+  
+  // “猜错了，游戏继续”的弹窗
+  void _showGuessResultDialog(bool correct, String feedback) {
+    if (Navigator.canPop(context)) {
+      Navigator.pop(context); 
+    }
+    showDialog(
+      context: context,
+      barrierDismissible: true, 
+      builder: (_) => AlertDialog(
+        title: Text(correct ? '🎉 推测正确！' : '😥 推测错误'),
+        content: Text(feedback),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context), 
+            child: const Text('知道了 (游戏继续)'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // “游戏结束”的弹窗
+  void _showGameOverDialog(bool correct, String feedback) {
+    if (Navigator.canPop(context)) {
+      Navigator.pop(context); 
+    }
+    showDialog(
+      context: context,
+      barrierDismissible: false, 
+      builder: (_) => AlertDialog(
+        title: Text(correct ? '🎉 推测正确！游戏结束！' : '游戏结束'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(feedback),
+            if (correct)
+              const Padding(
+                padding: EdgeInsets.only(top: 10.0),
+                child: Text('+5 分！', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context), 
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // --- (右侧栏函数 _buildRightColumn, _buildOnlinePlayersPanel, _playerTile, _roleOf, _roleColor, _buildBottomControls, _buildScoreControls, _buildOrderChips, _tile 保持不变) ---
   Widget _buildRightColumn() {
     final progressCard = Container(
       width: double.infinity,
@@ -775,18 +909,17 @@ class _ChatPageState extends State<ChatPage> {
             openingPanel,
             if (openingPanel is! SizedBox) const SizedBox(height: 12),
             onlinePanel,
-            const SizedBox(height: 16), // 与底部按钮拉开距离
+            const SizedBox(height: 16), 
 
-            if (isHost) _buildBottomControls(),   // Start/Stop + Yes/No/Unknown
+            if (isHost) _buildBottomControls(),   
             if (isHost) const SizedBox(height: 8),
-            if (isHost) _buildScoreControls(),    // ⭐ 新增：打分区
+            if (isHost) _buildScoreControls(),    
           ],
         ),
       ),
     );
   }
 
-  // 在线玩家（按 ID 升序）
   Widget _buildOnlinePlayersPanel() {
     final ids = List<int>.from(order)..sort();
     return Container(
@@ -877,7 +1010,6 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  // ====== 右侧底部按钮：Start/Stop + Yes/No/Unknown（带判定高亮） ======
   Widget _buildBottomControls() {
     final bool hl = awaitingVerdict;
     final ButtonStyle ynuStyle = ButtonStyle(
@@ -945,10 +1077,8 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // ====== 右侧底部“打分”区（仅主持人可见） ======
   Widget _buildScoreControls() {
     final int? target = lastQuestionUserId;
-    // 仅当存在“最近提问者”时显示；若本题已打过分，用一个提醒代替按钮
     if (target == null) {
       return Container(
         padding: const EdgeInsets.all(10),
@@ -1004,7 +1134,6 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // 发言顺序 Chips
   Widget _buildOrderChips() {
     if (order.isEmpty) return const Text('-', style: TextStyle(color: Colors.black54));
     final children = <Widget>[];
@@ -1036,7 +1165,6 @@ class _ChatPageState extends State<ChatPage> {
     return Wrap(children: children);
   }
 
-  // 顺序发言区消息项
   Widget _tile(Map<String, dynamic> m) {
     switch (m['type']) {
       case 'system':

@@ -1,17 +1,35 @@
-// bin/server.dart  或  server.dart
+// server.dart (完整内容)
+// bin/server.dart  (V3 - 数据库 & AI 自动计分版)
 import 'dart:io';
 import 'dart:convert';
+import 'dart:math'; // 用于数据库模拟
+
+// [AI 集成] 路径不变
+final String GAME_PATH = '/ws/game';
+final String BRIDGE_PATH = '/ws/bridge';
 
 void main(List<String> args) async {
   final port = args.isNotEmpty ? int.tryParse(args.first) ?? 8080 : 8080;
   final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
   print('WebSocket server listening on ws://localhost:$port');
+  print('  - 游戏客户端 (main.dart) 请连接: ws://localhost:$port$GAME_PATH');
+  print('  - AI 网桥 (bridge.py)   请连接: ws://localhost:$port$BRIDGE_PATH');
 
   final wsServer = _SoupServer();
   await for (HttpRequest req in server) {
     if (WebSocketTransformer.isUpgradeRequest(req)) {
-      final socket = await WebSocketTransformer.upgrade(req);
-      wsServer.handleClient(socket);
+      if (req.uri.path == GAME_PATH) {
+        final socket = await WebSocketTransformer.upgrade(req);
+        wsServer.handleClient(socket);
+      } else if (req.uri.path == BRIDGE_PATH) {
+        final socket = await WebSocketTransformer.upgrade(req);
+        wsServer.handleBridge(socket);
+      } else {
+        req.response
+          ..statusCode = HttpStatus.notFound
+          ..write('Unknown WebSocket path')
+          ..close();
+      }
     } else {
       req.response
         ..statusCode = HttpStatus.forbidden
@@ -21,52 +39,163 @@ void main(List<String> args) async {
   }
 }
 
+class _StoryData {
+  final String id;
+  final String storyFace; // 汤面 (公开)
+  final String storyBottom; // 汤底 (秘密)
+  _StoryData(this.id, this.storyFace, this.storyBottom);
+}
+
 class _SoupServer {
-  // 连接映射
   final Map<WebSocket, int> _connToId = {};
   final Map<int, WebSocket> _idToConn = {};
+  WebSocket? _bridgeChannel;
 
-  // —— 全局状态 —— //
-  int _nextId = 1;               // 1 号为主持人（首个连接）
+  String _currentStoryBottom = ""; // AI 判断的依据
+  int? _finalGuesserId; // 存储是谁提交了最终猜测
+
+  int _nextId = 1;
   bool running = false;
   bool waitingOpening = false;
   bool hostOpeningUsed = false;
   int? speakingId;
   int round = 1;
-  List<int> order = [];          // 含主持人 1
-  bool awaitingVerdict = false;  // 是否等待主持人判定（高亮）
+  List<int> order = [];
+  bool awaitingVerdict = false;
 
-  // —— 计分 —— //
-  final Map<int, int> scores = {}; // 玩家积分（id -> total）
-
-  // —— 头像（跨端同步，base64 PNG/JPG）—— //
-  final Map<int, String> avatarsB64 = {}; // id -> base64（不含 dataURI 头）
-
-  // —— 历史（最近 200 条，可调）—— //
+  final Map<int, int> scores = {};
+  final Map<int, String> avatarsB64 = {};
   final int _maxHistory = 200;
-  final List<Map<String, dynamic>> _histOrdered = []; // system/opening/chat/verdict/score/avatar
-  final List<Map<String, dynamic>> _histFree = [];    // freechat
+  final List<Map<String, dynamic>> _histOrdered = [];
+  final List<Map<String, dynamic>> _histFree = [];
 
-  // ===== 工具：把 int 键的 Map 转成 string 键（供 jsonEncode 使用） =====
   Map<String, T> _stringKeys<T>(Map<int, T> m) {
     final out = <String, T>{};
     m.forEach((k, v) => out['$k'] = v);
     return out;
   }
 
-  // 入口：处理新连接
+  Future<_StoryData> _fetchStoryFromDatabase(String? storyId) async {
+    await Future.delayed(Duration(milliseconds: 50));
+    final db = {
+      'story1': _StoryData(
+        'story1',
+        '（汤面）一个男人死在沙漠中，手里握着一根火柴。', 
+        '（汤底）男人和同伴乘坐热气球，热气球超重。他们抽火柴，男人抽到短的，被迫跳下。', 
+      ),
+      'story2': _StoryData(
+        'story2',
+        '（汤面）一个女人买了一双新鞋，当天她就死了。', 
+        '（汤底）女人是马戏团的飞刀表演助手。她的新鞋是高跟鞋，比平时高了5厘米。她的搭档（丈夫）扔飞刀时没有调整高度，失手杀死了她。', 
+      ),
+    };
+    final id = storyId ?? db.keys.toList()[Random().nextInt(db.length)];
+    return db[id] ?? db.values.first;
+  }
+
+  void handleBridge(WebSocket ws) {
+    print('[Server] ✅ AI Bridge (bridge.py) connected!');
+    _bridgeChannel = ws;
+    ws.listen(
+      _handleBridgeMessage,
+      onDone: () {
+        print('[Server] ❌ AI Bridge disconnected.');
+        _bridgeChannel = null;
+      },
+      onError: (e) {
+        print('[Server] ❌ AI Bridge error: $e');
+        _bridgeChannel = null;
+      },
+    );
+  }
+
+  // （“猜错不结束”的逻辑，保持不变）
+  void _handleBridgeMessage(dynamic message) {
+    print('[Server] ⬅️ Received AI Result from bridge: $message');
+    try {
+      final data = json.decode(message);
+      final type = data['type'];
+
+      if (type == 'ai_judge_question_result') {
+        if (data['error'] != null) {
+          print('[Server] ⚠️ AI returned an error: ${data['error']}');
+          return;
+        }
+        final judgeAnswer = data['judge_answer']?.toString() ?? '...';
+        final scoreResult = data['score_result'];
+        if (scoreResult is Map && speakingId != null) {
+          final score = scoreResult['score'];
+          if (score is int && score > 0) {
+            print('[Server] 🤖 Applying AI score $score to player $speakingId');
+            _applyScore(speakingId!, score); 
+          }
+        }
+        if (awaitingVerdict && speakingId != null) {
+          print('[Server] 🤖 AI is submitting verdict: "$judgeAnswer"');
+          _onVerdict(judgeAnswer);
+        } else {
+          print('[Server] ⚠️ AI sent a verdict, but we were not awaiting one.');
+        }
+      }
+      
+      else if (type == 'ai_validate_final_answer_result') {
+        final status = data['validation_status']?.toString() ?? 'INCORRECT';
+        final feedback = data['feedback']?.toString() ?? '...';
+
+        final int? guesserId = _finalGuesserId;
+        _finalGuesserId = null; 
+        
+        if (guesserId == null) {
+          print('[Server] ⚠️ Received final answer result, but no guesser was stored.');
+          return;
+        }
+
+        final bool correct = (status == 'CORRECT');
+        
+        if (correct) {
+          // --- 逻辑：正确 ---
+          // (之前已 -3, 现在 +5)
+          print('[Server] 🤖  guess correct for $guesserId. Applying +5 score.');
+          scores[guesserId] = (scores[guesserId] ?? 0) + 5;
+          final finalScore = scores[guesserId]; 
+          
+          _broadcast({
+            "type": "game_over",
+            "guesserId": guesserId,
+            "correct": true,
+            "feedback": feedback,
+            "finalScore": finalScore,
+          });
+          
+          _onStop(); // (猜对时才停止)
+
+        } else {
+          // --- 逻辑：错误 ---
+          // (之前已 -3, 现在 0)
+          print('[Server] 🤖  guess incorrect for $guesserId. Game continues.');
+          final WebSocket? guesserConn = _idToConn[guesserId];
+          if (guesserConn != null) {
+            _send(guesserConn, {
+              "type": "final_guess_result", 
+              "correct": false,
+              "feedback": feedback,
+            });
+          }
+        }
+      }
+
+    } catch (e) {
+      print('[Server] Error parsing bridge message: $e');
+    }
+  }
+
+  // [!! 修改 !!]
+  // 'case final_guess' 增加了积分检查和扣分
   void handleClient(WebSocket ws) {
     final id = _assignId(ws);
     final isHost = (id == 1);
 
-    // welcome
-    _send(ws, {
-      'type': 'welcome',
-      'playerId': id,
-      'isHost': isHost,
-    });
-
-    // 首次下发历史 & 积分 & 头像（注意把 Map<int,...> 的键转成字符串）
+    _send(ws, {'type': 'welcome', 'playerId': id, 'isHost': isHost});
     _send(ws, {
       'type': 'bulkSync',
       'ordered': _histOrdered,
@@ -74,8 +203,6 @@ class _SoupServer {
       'scores': _stringKeys(scores),
       'avatars': _stringKeys(avatarsB64),
     });
-
-    // 下发当前状态
     _broadcastState();
 
     ws.listen((data) {
@@ -85,11 +212,7 @@ class _SoupServer {
 
         switch (type) {
           case 'restore':
-            _send(ws, {
-              'type': 'welcome',
-              'playerId': id,
-              'isHost': isHost,
-            });
+            _send(ws, {'type': 'welcome', 'playerId': id, 'isHost': isHost});
             _send(ws, {
               'type': 'bulkSync',
               'ordered': _histOrdered,
@@ -105,53 +228,45 @@ class _SoupServer {
             final action = (msg['action'] ?? '').toString();
             switch (action) {
               case 'start':
-                _onStart();
+                final storyId = msg['storyId']?.toString();
+                _onStart(storyId); 
                 break;
               case 'stop':
                 _onStop();
                 break;
-              case 'opening':
-                _onOpening((msg['text'] ?? '').toString());
-                break;
-              case 'skipOpening':
-                _onSkipOpening();
-                break;
               case 'verdict':
+                print('[Server] 👨‍⚖️ Host is submitting verdict manually.');
                 _onVerdict((msg['verdict'] ?? '').toString());
                 break;
+              case 'opening':
+                 print('[Server] ⚠️ "opening" action is deprecated (now automated).');
+                break;
+              case 'skipOpening':
+                 print('[Server] ⚠️ "skipOpening" action is deprecated (now automated).');
+                break;
               case 'score':
-                final to = msg['to'];
-                final delta = msg['delta'];
-                if (to is int && delta is int && delta >= 0 && delta <= 3) {
-                  _applyScore(to, delta);
-                }
+                print('[Server] ⚠️ "score" action is deprecated (now automated by AI).');
                 break;
             }
             break;
 
           case 'avatar':
-            // 任何玩家都可更新自己的头像；限制体积以防滥用
             final pngB64 = (msg['pngB64'] ?? '').toString();
             if (pngB64.isEmpty) break;
-            // 体积限制（base64长度大致等于原始*1.33），这里约 100KB 原图
-            if (pngB64.length > 140000) {
-              print('Avatar too large from id=$id, ignored.');
-              break;
-            }
+            if (pngB64.length > 140000) break;
             avatarsB64[id] = pngB64;
             final objAvatar = {
               'type': 'avatar',
               'id': id,
               'pngB64': pngB64,
-              'ts': DateTime.now().toIso8601String(),
+              'ts': DateTime.now().toIso8601String(), 
             };
             _broadcast(objAvatar);
-            _pushOrdered(objAvatar); // 作为事件记录（可选）
-            _broadcastState();       // state 中也包含 avatars
+            _pushOrdered(objAvatar);
+            _broadcastState();
             break;
 
           case 'chat':
-            // 顺序发言：仅当前发言观众可说
             if (!running || waitingOpening) break;
             if (speakingId != id) break;
 
@@ -162,17 +277,18 @@ class _SoupServer {
               'type': 'chat',
               'from': id,
               'text': text,
-              'ts': DateTime.now().toIso8601String(),
+              'ts': DateTime.now().toIso8601String(), 
             };
             _broadcast(objChat);
             _pushOrdered(objChat);
+            
+            _sendTaskToAI(objChat); 
 
             awaitingVerdict = true;
             _broadcastState();
             break;
 
           case 'freechat':
-            // 自由聊天：主持人不可发言，其余人随时可发
             if (id == 1) break;
             final text2 = (msg['text'] ?? '').toString();
             if (text2.isEmpty) break;
@@ -181,11 +297,67 @@ class _SoupServer {
               'type': 'freechat',
               'from': id,
               'text': text2,
-              'ts': DateTime.now().toIso8601String(),
+              'ts': DateTime.now().toIso8601String(), 
             };
             _broadcast(objFree);
             _pushFree(objFree);
             break;
+            
+          // [!! 这里的整个 case 都被重写了 !!]
+          case 'final_guess':
+            if (!running) break;
+            final text = (msg['text'] ?? '').toString();
+            final storyTruth = _currentStoryBottom;
+            if (text.isEmpty || storyTruth.isEmpty) break;
+
+            final int guesserId = id;
+            final int currentScore = scores[guesserId] ?? 0;
+
+            // 1. 检查积分是否足够
+            if (currentScore < 3) {
+              print('[Server] ⚠️ Player $guesserId tried to guess (score $currentScore < 3).');
+              final WebSocket? guesserConn = _idToConn[guesserId];
+              if (guesserConn != null) {
+                _send(guesserConn, {
+                  "type": "final_guess_result",
+                  "correct": false,
+                  "feedback": "积分不足 3 分，无法推测。游戏继续。",
+                });
+              }
+              break; // 积分不足，停止处理
+            }
+            
+            // 2. 检查 AI Bridge 是否连接
+            if (_bridgeChannel == null) {
+              print('[Server] ⚠️ Bridge not connected. Cannot validate final answer.');
+              final WebSocket? guesserConn = _idToConn[guesserId];
+              if (guesserConn != null) {
+                _send(guesserConn, {
+                  "type": "final_guess_result",
+                  "correct": false,
+                  "feedback": "错误：AI 验证服务未连接。未扣除积分，游戏继续。", // 告知未扣分
+                });
+              }
+              break; // AI 未连接，停止处理
+            }
+
+            // 3. 检查通过：扣分并发送至 AI
+            print('[Server] ➡️ Player $guesserId guessing. Deducting 3 points from $currentScore.');
+            scores[guesserId] = currentScore - 3; // <-- 立即扣分
+            _finalGuesserId = guesserId;          // <-- 记录猜测者
+            _broadcastState();                  // <-- 广播分数变化
+
+            final aiTask = {
+              "type": "ai_validate_final_answer",
+              "request_id": "final-${DateTime.now().toIso8601String()}-$id",
+              "story_truth": storyTruth,
+              "final_answer_text": text,
+            };
+            
+            print('[Server] ➡️ Forwarding final answer task to Bridge...');
+            _bridgeChannel!.add(jsonEncode(aiTask));
+            break;
+
         }
       } catch (e) {
         print('Error handling message: $e');
@@ -198,7 +370,35 @@ class _SoupServer {
     });
   }
 
-  // 分配玩家 ID（首个为主持人 1）
+  void _sendTaskToAI(Map<String, dynamic> chatObject) {
+    if (_bridgeChannel == null) {
+      print('[Server] ⚠️ Bridge not connected. AI cannot judge. Host must judge manually.');
+      return;
+    }
+    final storyTruth = _currentStoryBottom; 
+    if (storyTruth.isEmpty) {
+       print('[Server] ⚠️ _currentStoryBottom is empty. AI cannot judge.');
+       return;
+    }
+    final List<Map<String, String>> aiHistory = [];
+    for (final h in _histOrdered) {
+      if (h['type'] == 'chat') {
+        aiHistory.add({"role": "user", "content": h['text']});
+      } else if (h['type'] == 'verdict') {
+        aiHistory.add({"role": "assistant", "content": h['verdict']});
+      }
+    }
+    final aiTask = {
+      "type": "ai_judge_question",
+      "request_id": chatObject['ts'], 
+      "story_truth": storyTruth, 
+      "history": aiHistory,
+      "new_question": chatObject['text'],
+    };
+    print('[Server] ➡️ Forwarding task to Bridge...');
+    _bridgeChannel!.add(jsonEncode(aiTask));
+  }
+
   int _assignId(WebSocket ws) {
     if (!_idToConn.containsKey(1)) {
       _connToId[ws] = 1;
@@ -233,22 +433,42 @@ class _SoupServer {
     _broadcastState();
   }
 
-  // —— 流程控制 —— //
-  void _onStart() {
+  void _onStart(String? storyId) async { 
+    print('[Server] Host started game. Fetching story (id: $storyId)...');
+    _StoryData storyData;
+    try {
+      storyData = await _fetchStoryFromDatabase(storyId);
+    } catch (e) {
+      print('[Server] ❌ FATAL: Failed to fetch story from DB: $e');
+      return;
+    }
+    _currentStoryBottom = storyData.storyBottom; 
+    
     running = true;
-    waitingOpening = true;
-    hostOpeningUsed = false;
+    waitingOpening = false; 
+    hostOpeningUsed = true; 
     speakingId = null;
     round = 1;
     awaitingVerdict = false;
+    _finalGuesserId = null; 
 
-    final obj = {
+    final objStart = {
       'type': 'system',
-      'text': '游戏开始，等待主持人开场',
-      'ts': DateTime.now().toIso8601String(),
+      'text': '游戏开始！',
+      'ts': DateTime.now().toIso8601String(), 
     };
-    _broadcast(obj);
-    _pushOrdered(obj);
+    _broadcast(objStart);
+    _pushOrdered(objStart);
+
+    final objFace = {
+      'type': 'opening', 
+      'text': storyData.storyFace, 
+      'ts': DateTime.now().toIso8601String(), 
+    };
+    _broadcast(objFace);
+    _pushOrdered(objFace); 
+
+    _setFirstAudienceAsSpeaker();
     _broadcastState();
   }
 
@@ -256,49 +476,25 @@ class _SoupServer {
     running = false;
     waitingOpening = false;
     awaitingVerdict = false;
+    _currentStoryBottom = ""; 
+    _finalGuesserId = null; 
 
     final obj = {
-      'type': 'system',
-      'text': '游戏已停止',
-      'ts': DateTime.now().toIso8601String(),
+      'type': 'game_over', 
+      'feedback': '主持人已停止游戏。',
+      'correct': false, 
+      'ts': DateTime.now().toIso8601String(), 
     };
     _broadcast(obj);
     _pushOrdered(obj);
-    _broadcastState();
+    _broadcastState(); 
   }
 
   void _onOpening(String text) {
-    if (!running || !waitingOpening || hostOpeningUsed) return;
-    hostOpeningUsed = true;
-    waitingOpening = false;
-
-    final obj = {
-      'type': 'opening',
-      'text': text,
-      'ts': DateTime.now().toIso8601String(),
-    };
-    _broadcast(obj);
-    _pushOrdered(obj);
-
-    _setFirstAudienceAsSpeaker();
-    _broadcastState();
+    print('[Server] ⚠️ _onOpening is deprecated.');
   }
-
   void _onSkipOpening() {
-    if (!running || !waitingOpening) return;
-    hostOpeningUsed = true;
-    waitingOpening = false;
-
-    final obj = {
-      'type': 'system',
-      'text': '主持人跳过开场',
-      'ts': DateTime.now().toIso8601String(),
-    };
-    _broadcast(obj);
-    _pushOrdered(obj);
-
-    _setFirstAudienceAsSpeaker();
-    _broadcastState();
+    print('[Server] ⚠️ _onSkipOpening is deprecated.');
   }
 
   void _onVerdict(String verdict) {
@@ -309,7 +505,7 @@ class _SoupServer {
       'type': 'verdict',
       'to': speakingId,
       'verdict': verdict,
-      'ts': DateTime.now().toIso8601String(),
+      'ts': DateTime.now().toIso8601String(), 
     };
     _broadcast(obj);
     _pushOrdered(obj);
@@ -347,23 +543,20 @@ class _SoupServer {
     }
   }
 
-  // —— 计分逻辑 —— //
   void _applyScore(int to, int delta) {
     scores[to] = (scores[to] ?? 0) + delta;
-
     final obj = {
       'type': 'score',
       'to': to,
       'delta': delta,
       'total': scores[to],
-      'ts': DateTime.now().toIso8601String(),
+      'ts': DateTime.now().toIso8601String(), 
     };
     _broadcast(obj);
     _pushOrdered(obj);
     _broadcastState();
   }
 
-  // —— 历史入库 —— //
   void _pushOrdered(Map<String, dynamic> obj) {
     _histOrdered.add(obj);
     if (_histOrdered.length > _maxHistory) {
@@ -378,19 +571,18 @@ class _SoupServer {
     }
   }
 
-  // —— 广播/发送 —— //
   void _broadcastState() {
     final payload = {
       'type': 'state',
       'running': running,
-      'waitingOpening': waitingOpening,
-      'hostOpeningUsed': hostOpeningUsed,
+      'waitingOpening': waitingOpening, 
+      'hostOpeningUsed': hostOpeningUsed, 
       'speakingId': speakingId,
       'round': round,
       'order': order,
       'awaitingVerdict': awaitingVerdict,
-      'scores': _stringKeys(scores),     // ★ 键转字符串
-      'avatars': _stringKeys(avatarsB64) // ★ 键转字符串
+      'scores': _stringKeys(scores),
+      'avatars': _stringKeys(avatarsB64)
     };
     print('[STATE] running=$running waitingOpening=$waitingOpening '
         'speakingId=$speakingId round=$round '
