@@ -1,21 +1,70 @@
-// server.dart (完整内容)
-// bin/server.dart  (V3 - 数据库 & AI 自动计分版)
+// server.dart (完整内容 - 已集成 SQLite)
 import 'dart:io';
 import 'dart:convert';
-import 'dart:math'; // 用于数据库模拟
+import 'dart:math'; 
+import 'package:sqlite3/sqlite3.dart'; // [!! 新增 !!]
 
 // [AI 集成] 路径不变
 final String GAME_PATH = '/ws/game';
 final String BRIDGE_PATH = '/ws/bridge';
 
+// [!! 新增 !!]
+// 数据库初始化函数
+Database _initDatabase() {
+  print('[DB] Initializing database...');
+  final db = sqlite3.open('stories.db'); // 这将在服务器根目录创建文件
+  
+  // 创建表 (如果不存在)
+  db.execute('''
+    CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY NOT NULL,
+      storyFace TEXT NOT NULL,
+      storyBottom TEXT NOT NULL,
+      imgURL TEXT
+    );
+  ''');
+  
+  // 检查表是否为空，如果为空则插入一些示例数据
+  final ResultSet check = db.select('SELECT COUNT(*) as count FROM stories');
+  if (check.first['count'] == 0) {
+    print('[DB] Database is empty. Inserting sample data...');
+    db.execute('''
+      INSERT INTO stories (id, storyFace, storyBottom, imgURL) VALUES
+      (
+        'story1',
+        '（汤面）一个男人死在沙漠中，手里握着一根火柴。',
+        '（汤底）男人和同伴乘坐热气球，热气球超重。他们抽火柴，男人抽到短的，被迫跳下。',
+        'https://images.unsplash.com/photo-1506703121853-33362673a58d?fit=crop&w=1200&q=80'
+      ),
+      (
+        'story2',
+        '（汤面）一个女人买了一双新鞋，当天她就死了。',
+        '（汤底）女人是马戏团的飞刀表演助手。她的新鞋是高跟鞋，比平时高了5厘米。她的搭档（丈夫）扔飞刀时没有调整高度，失手杀死了她。',
+        'https://images.unsplash.com/photo-1543163521-1bf539c55dd2?fit=crop&w=1200&q=80'
+      );
+    ''');
+    print('[DB] Sample data inserted.');
+  }
+  
+  print('[DB] Database initialized successfully.');
+  return db;
+}
+
+
 void main(List<String> args) async {
   final port = args.isNotEmpty ? int.tryParse(args.first) ?? 8080 : 8080;
+  
+  // [!! 修改 !!]
+  // 初始化数据库并将其传递给服务器
+  final db = _initDatabase();
+  
   final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
   print('WebSocket server listening on ws://localhost:$port');
   print('  - 游戏客户端 (main.dart) 请连接: ws://localhost:$port$GAME_PATH');
   print('  - AI 网桥 (bridge.py)   请连接: ws://localhost:$port$BRIDGE_PATH');
 
-  final wsServer = _SoupServer();
+  final wsServer = _SoupServer(db); // [!! 修改 !!] 传入 db
+  
   await for (HttpRequest req in server) {
     if (WebSocketTransformer.isUpgradeRequest(req)) {
       if (req.uri.path == GAME_PATH) {
@@ -39,20 +88,27 @@ void main(List<String> args) async {
   }
 }
 
+// [!! 修改 !!]
+// _StoryData 类现在包含 imgURL
 class _StoryData {
   final String id;
-  final String storyFace; // 汤面 (公开)
-  final String storyBottom; // 汤底 (秘密)
-  _StoryData(this.id, this.storyFace, this.storyBottom);
+  final String storyFace; 
+  final String storyBottom; 
+  final String? imgURL; // (可以为 null)
+  _StoryData(this.id, this.storyFace, this.storyBottom, this.imgURL);
 }
 
 class _SoupServer {
   final Map<WebSocket, int> _connToId = {};
   final Map<int, WebSocket> _idToConn = {};
   WebSocket? _bridgeChannel;
+  
+  final Database _db; // [!! 新增 !!] 数据库实例
 
-  String _currentStoryBottom = ""; // AI 判断的依据
-  int? _finalGuesserId; // 存储是谁提交了最终猜测
+  String _currentStoryBottom = ""; 
+  String? _currentStoryImgUrl = ""; // [!! 新增 !!]
+  
+  int? _finalGuesserId; 
 
   int _nextId = 1;
   bool running = false;
@@ -68,6 +124,10 @@ class _SoupServer {
   final int _maxHistory = 200;
   final List<Map<String, dynamic>> _histOrdered = [];
   final List<Map<String, dynamic>> _histFree = [];
+  
+  // [!! 修改 !!]
+  // 构造函数现在需要数据库
+  _SoupServer(this._db);
 
   Map<String, T> _stringKeys<T>(Map<int, T> m) {
     final out = <String, T>{};
@@ -75,22 +135,40 @@ class _SoupServer {
     return out;
   }
 
+  // [!! 修改 !!]
+  // 重写了数据库访问函数，使其使用 SQLite
   Future<_StoryData> _fetchStoryFromDatabase(String? storyId) async {
-    await Future.delayed(Duration(milliseconds: 50));
-    final db = {
-      'story1': _StoryData(
-        'story1',
-        '（汤面）一个男人死在沙漠中，手里握着一根火柴。', 
-        '（汤底）男人和同伴乘坐热气球，热气球超重。他们抽火柴，男人抽到短的，被迫跳下。', 
-      ),
-      'story2': _StoryData(
-        'story2',
-        '（汤面）一个女人买了一双新鞋，当天她就死了。', 
-        '（汤底）女人是马戏团的飞刀表演助手。她的新鞋是高跟鞋，比平时高了5厘米。她的搭档（丈夫）扔飞刀时没有调整高度，失手杀死了她。', 
-      ),
-    };
-    final id = storyId ?? db.keys.toList()[Random().nextInt(db.length)];
-    return db[id] ?? db.values.first;
+    // (不再需要 Future.delayed，因为数据库查询是 I/O 操作)
+    
+    ResultSet results;
+    
+    if (storyId != null) {
+      // 尝试按 ID 获取
+      results = _db.select('SELECT * FROM stories WHERE id = ?', [storyId]);
+    } else {
+      // 如果没有 ID，随机获取一个
+      results = _db.select('SELECT * FROM stories ORDER BY RANDOM() LIMIT 1');
+    }
+
+    if (results.isEmpty) {
+      // 如果数据库为空或找不到
+      print('[DB] ❌ Error: No stories found in database.');
+      // 返回一个安全的默认值
+      return _StoryData(
+        'error', 
+        '（错误）数据库中没有找到故事。', 
+        '（错误）请联系主持人检查服务器。', 
+        null
+      );
+    }
+    
+    final row = results.first;
+    return _StoryData(
+      row['id'] as String,
+      row['storyFace'] as String,
+      row['storyBottom'] as String,
+      row['imgURL'] as String?, // (可以是 null)
+    );
   }
 
   void handleBridge(WebSocket ws) {
@@ -109,7 +187,7 @@ class _SoupServer {
     );
   }
 
-  // （“猜错不结束”的逻辑，保持不变）
+  // (此函数包含排行榜逻辑，无需改动)
   void _handleBridgeMessage(dynamic message) {
     print('[Server] ⬅️ Received AI Result from bridge: $message');
     try {
@@ -154,10 +232,11 @@ class _SoupServer {
         
         if (correct) {
           // --- 逻辑：正确 ---
-          // (之前已 -3, 现在 +5)
           print('[Server] 🤖  guess correct for $guesserId. Applying +5 score.');
           scores[guesserId] = (scores[guesserId] ?? 0) + 5;
           final finalScore = scores[guesserId]; 
+          
+          final leaderboard = _generateLeaderboard();
           
           _broadcast({
             "type": "game_over",
@@ -165,13 +244,13 @@ class _SoupServer {
             "correct": true,
             "feedback": feedback,
             "finalScore": finalScore,
+            "leaderboard": leaderboard, // 发送排行榜
           });
           
-          _onStop(); // (猜对时才停止)
+          _onStop(triggeredByGuess: true); // 传递参数避免重复广播
 
         } else {
           // --- 逻辑：错误 ---
-          // (之前已 -3, 现在 0)
           print('[Server] 🤖  guess incorrect for $guesserId. Game continues.');
           final WebSocket? guesserConn = _idToConn[guesserId];
           if (guesserConn != null) {
@@ -189,8 +268,7 @@ class _SoupServer {
     }
   }
 
-  // [!! 修改 !!]
-  // 'case final_guess' 增加了积分检查和扣分
+  // (此函数包含 -3 分逻辑，无需改动)
   void handleClient(WebSocket ws) {
     final id = _assignId(ws);
     final isHost = (id == 1);
@@ -232,7 +310,7 @@ class _SoupServer {
                 _onStart(storyId); 
                 break;
               case 'stop':
-                _onStop();
+                _onStop(); // 默认是主持人停止
                 break;
               case 'verdict':
                 print('[Server] 👨‍⚖️ Host is submitting verdict manually.');
@@ -303,7 +381,6 @@ class _SoupServer {
             _pushFree(objFree);
             break;
             
-          // [!! 这里的整个 case 都被重写了 !!]
           case 'final_guess':
             if (!running) break;
             final text = (msg['text'] ?? '').toString();
@@ -313,7 +390,6 @@ class _SoupServer {
             final int guesserId = id;
             final int currentScore = scores[guesserId] ?? 0;
 
-            // 1. 检查积分是否足够
             if (currentScore < 3) {
               print('[Server] ⚠️ Player $guesserId tried to guess (score $currentScore < 3).');
               final WebSocket? guesserConn = _idToConn[guesserId];
@@ -324,10 +400,9 @@ class _SoupServer {
                   "feedback": "积分不足 3 分，无法推测。游戏继续。",
                 });
               }
-              break; // 积分不足，停止处理
+              break; 
             }
             
-            // 2. 检查 AI Bridge 是否连接
             if (_bridgeChannel == null) {
               print('[Server] ⚠️ Bridge not connected. Cannot validate final answer.');
               final WebSocket? guesserConn = _idToConn[guesserId];
@@ -335,17 +410,16 @@ class _SoupServer {
                 _send(guesserConn, {
                   "type": "final_guess_result",
                   "correct": false,
-                  "feedback": "错误：AI 验证服务未连接。未扣除积分，游戏继续。", // 告知未扣分
+                  "feedback": "错误：AI 验证服务未连接。未扣除积分，游戏继续。",
                 });
               }
-              break; // AI 未连接，停止处理
+              break; 
             }
 
-            // 3. 检查通过：扣分并发送至 AI
             print('[Server] ➡️ Player $guesserId guessing. Deducting 3 points from $currentScore.');
-            scores[guesserId] = currentScore - 3; // <-- 立即扣分
-            _finalGuesserId = guesserId;          // <-- 记录猜测者
-            _broadcastState();                  // <-- 广播分数变化
+            scores[guesserId] = currentScore - 3; 
+            _finalGuesserId = guesserId;          
+            _broadcastState();                  
 
             final aiTask = {
               "type": "ai_validate_final_answer",
@@ -433,60 +507,91 @@ class _SoupServer {
     _broadcastState();
   }
 
+  // [!! 修改 !!]
+  // (增加了重置逻辑，并存储/广播 imgURL)
   void _onStart(String? storyId) async { 
     print('[Server] Host started game. Fetching story (id: $storyId)...');
+
+    // 1. [!! 新增 !!] 重置分数, 历史记录, 和轮次
+    print('[Server] Resetting game state: Scores, History, Round.');
+    scores.clear();
+    _histOrdered.clear();
+    _histFree.clear();
+    
+    // 2. [!! 新增 !!] 将所有当前连接的玩家分数重置为 0
+    // (注意: 头像 avatarsB64 和 玩家列表 order 不重置)
+    for (final id in _idToConn.keys) {
+      scores[id] = 0;
+    }
+
     _StoryData storyData;
     try {
+      // 3. [!! 修改 !!] 从真实数据库获取
       storyData = await _fetchStoryFromDatabase(storyId);
     } catch (e) {
       print('[Server] ❌ FATAL: Failed to fetch story from DB: $e');
       return;
     }
-    _currentStoryBottom = storyData.storyBottom; 
     
+    // 4. [!! 修改 !!] 存储汤底和图片 URL
+    _currentStoryBottom = storyData.storyBottom; 
+    _currentStoryImgUrl = storyData.imgURL;
+    
+    // 5. 重置游戏状态
     running = true;
     waitingOpening = false; 
     hostOpeningUsed = true; 
     speakingId = null;
-    round = 1;
+    round = 1; // 确保轮次重置为 1
     awaitingVerdict = false;
     _finalGuesserId = null; 
 
     final objStart = {
       'type': 'system',
-      'text': '游戏开始！',
+      'text': '游戏开始！(分数已重置)', // 提示玩家分数已重置
       'ts': DateTime.now().toIso8601String(), 
     };
     _broadcast(objStart);
     _pushOrdered(objStart);
 
+    // 6. [!! 修改 !!] 广播汤面时，带上 imgURL
     final objFace = {
       'type': 'opening', 
       'text': storyData.storyFace, 
+      'imgURL': _currentStoryImgUrl, // [!! 新增 !!]
       'ts': DateTime.now().toIso8601String(), 
     };
     _broadcast(objFace);
     _pushOrdered(objFace); 
 
     _setFirstAudienceAsSpeaker();
-    _broadcastState();
+    _broadcastState(); // 这将广播清空后的分数和状态
   }
 
-  void _onStop() {
+  // [!! 修改 !!]
+  // (增加了重置 imgURL 的逻辑)
+  void _onStop({bool triggeredByGuess = false}) {
     running = false;
     waitingOpening = false;
     awaitingVerdict = false;
     _currentStoryBottom = ""; 
+    _currentStoryImgUrl = null; // [!! 新增 !!] 重置图片
     _finalGuesserId = null; 
 
-    final obj = {
-      'type': 'game_over', 
-      'feedback': '主持人已停止游戏。',
-      'correct': false, 
-      'ts': DateTime.now().toIso8601String(), 
-    };
-    _broadcast(obj);
-    _pushOrdered(obj);
+    if (!triggeredByGuess) {
+      final leaderboard = _generateLeaderboard();
+
+      final obj = {
+        'type': 'game_over', 
+        'feedback': '主持人已停止游戏。',
+        'correct': false, 
+        'ts': DateTime.now().toIso8601String(),
+        'leaderboard': leaderboard, // 发送排行榜
+      };
+      _broadcast(obj);
+      _pushOrdered(obj);
+    }
+    
     _broadcastState(); 
   }
 
@@ -555,6 +660,16 @@ class _SoupServer {
     _broadcast(obj);
     _pushOrdered(obj);
     _broadcastState();
+  }
+  
+  // (此函数用于生成排行榜，无需改动)
+  List<Map<String, dynamic>> _generateLeaderboard() {
+    final sortedScores = scores.entries.toList();
+    sortedScores.sort((a, b) => b.value.compareTo(a.value));
+    final topScores = sortedScores.take(3);
+    return topScores.map((entry) {
+      return {'id': entry.key, 'score': entry.value};
+    }).toList();
   }
 
   void _pushOrdered(Map<String, dynamic> obj) {

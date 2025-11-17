@@ -10,9 +10,6 @@ import 'package:web_socket_channel/html.dart' as html;
 import 'package:file_picker/file_picker.dart';
 import 'package:image/image.dart' as img;
 
-// main.dart (完整内容)
-
-
 void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
@@ -47,6 +44,8 @@ class _ChatPageState extends State<ChatPage> {
   int? speakingId;
   int round = 1;
   List<int> order = [];
+  
+  String? _currentBgImgUrl; // [!! 新增 !!]
 
   // 判定高亮
   bool awaitingVerdict = false;
@@ -124,7 +123,6 @@ class _ChatPageState extends State<ChatPage> {
     await _prefs?.setString(_avatarKey, base64Encode(bytes));
   }
 
-  /// 选择本机图片 -> 裁剪正方形 -> 缩放 256 -> 圆形透明
   Future<void> _pickAvatar() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.image, withData: true, allowMultiple: false,
@@ -179,6 +177,8 @@ class _ChatPageState extends State<ChatPage> {
     setState(() {});
   }
 
+  // [!! 修改 !!]
+  // 增加了对 'opening' 和 'game_over' / 'state' 的 imgURL 处理
   void _connect() {
     try {
       final uri = Uri.parse(wsAddress);
@@ -241,6 +241,10 @@ class _ChatPageState extends State<ChatPage> {
               order = (map['order'] as List).map((e) => e as int).toList();
               final av = map['awaitingVerdict'];
               awaitingVerdict = (av == true) || (av == 1) || (av == 'true');
+              
+              if (running == false) {
+                _currentBgImgUrl = null; // [!! 新增 !!] 游戏停止时清除背景
+              }
 
               final dynamic ss = map['scores'];
               if (ss is Map) {
@@ -257,13 +261,21 @@ class _ChatPageState extends State<ChatPage> {
           case 'system':
           case 'chat':
           case 'verdict':
-          case 'opening':
             setState(() {
               messages.add(Map<String, dynamic>.from(map));
               if (map['type'] == 'chat' && map['from'] is int) {
                 lastQuestionUserId = map['from'] as int;
                 _scoredThisTurn.remove(lastQuestionUserId); 
               }
+            });
+            _scrollToEnd(_scrollOrder);
+            break;
+            
+          // [!! 修改 !!]
+          case 'opening':
+            setState(() {
+              messages.add(Map<String, dynamic>.from(map));
+              _currentBgImgUrl = map['imgURL'] as String?; // [!! 新增 !!]
             });
             _scrollToEnd(_scrollOrder);
             break;
@@ -298,10 +310,17 @@ class _ChatPageState extends State<ChatPage> {
               if (guesser == myId && finalScore is num) {
                 scores[myId!] = finalScore.toInt();
               }
+              _currentBgImgUrl = null; // [!! 新增 !!] 游戏结束时清除背景
             });
+            
+            final leaderboard = map['leaderboard'] as List<dynamic>?; 
+            final guesserId = map['guesserId'];
+            
             _showGameOverDialog(
               map['correct'] == true,
               map['feedback']?.toString() ?? '游戏结束。',
+              leaderboard,
+              guesserId: guesserId,
             );
             break;
             
@@ -402,6 +421,8 @@ class _ChatPageState extends State<ChatPage> {
     super.dispose();
   }
 
+  // [!! 修改 !!]
+  // 背景色改为半透明
   Widget _buildLeftSidebar() {
     final roleLabel = isHost ? '主持人' : (speakingId == myId ? '发言人' : '观众');
     final roleColor = isHost ? Colors.orange : (speakingId == myId ? Colors.blue : Colors.grey);
@@ -410,7 +431,7 @@ class _ChatPageState extends State<ChatPage> {
       width: 220,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
+        color: const Color.fromRGBO(245, 245, 245, 0.9), // [!! 修改 !!]
         border: Border(right: BorderSide(color: Colors.grey.shade300)),
       ),
       child: Column(
@@ -545,10 +566,12 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  // [!! 修改 !!]
+  // 背景色改为半透明
   Widget _buildOrderedChatPanel() {
     return Container(
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
+        color: const Color.fromRGBO(245, 245, 245, 0.9), // [!! 修改 !!]
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.grey.shade300),
       ),
@@ -599,11 +622,13 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  // [!! 修改 !!]
+  // 背景色改为半透明
   Widget _buildFreeChatPanel() {
     final hint = isHost ? '主持人不可在自由区发言' : '自由聊天…（无需按顺序）';
     return Container(
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: const Color.fromRGBO(255, 255, 255, 0.9), // [!! 修改 !!]
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.grey.shade300),
       ),
@@ -660,8 +685,7 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // [!! 修改 !!]
-  // 增加了对分数 >= 3 的判断
+  // （积分检查的逻辑保持不变）
   Widget _buildScoreBoard() {
     if (isHost) {
       final ids = List<int>.from(order)..sort();
@@ -679,18 +703,14 @@ class _ChatPageState extends State<ChatPage> {
     } else {
       // --- 玩家侧 ---
       final myScore = scores[myId ?? -1] ?? 0;
-      
-      // [!! 新增 !!] 判断是否可推测
       final bool canGuess = running && (myScore >= 3);
-      
-      // [!! 新增 !!] 根据状态决定按钮文本
       final String buttonText;
       if (!running) {
-        buttonText = '推测汤底'; // 游戏未开始，按钮反正也是禁用的
+        buttonText = '推测汤底';
       } else if (myScore < 3) {
-        buttonText = '推测 (需 3 分)'; // 游戏进行中，但分数不够
+        buttonText = '推测 (需 3 分)'; 
       } else {
-        buttonText = '推测汤底 (-3 分)'; // 游戏进行中，且分数足够
+        buttonText = '推测汤底 (-3 分)';
       }
 
       return Center(
@@ -709,11 +729,9 @@ class _ChatPageState extends State<ChatPage> {
             ),
             const SizedBox(height: 10), 
             ElevatedButton.icon(
-              // [!! 修改 !!] 
-              // 只有 canGuess (running 且 score >= 3) 时才可点击
               onPressed: canGuess ? _showGuessSoupDialog : null, 
               icon: const Icon(Icons.psychology),
-              label: Text(buttonText), // [!! 修改 !!] 使用动态文本
+              label: Text(buttonText),
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.amber,
                 foregroundColor: Colors.black,
@@ -737,13 +755,13 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // 弹窗逻辑不变 (UI 上已做了限制，服务器会做最终校验)
+  // （弹窗逻辑保持不变）
   void _showGuessSoupDialog() {
     _soupGuessCtrl.clear();
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('推测汤底 (将消耗 3 分)'), // 提示
+        title: const Text('推测汤底 (将消耗 3 分)'), 
         content: TextField(
           controller: _soupGuessCtrl,
           decoration: const InputDecoration(
@@ -771,14 +789,14 @@ class _ChatPageState extends State<ChatPage> {
                 ),
               );
             },
-            child: const Text('提交 (-3 分)'), // 提示
+            child: const Text('提交 (-3 分)'), 
           ),
         ],
       ),
     );
   }
   
-  // “猜错了，游戏继续”的弹窗
+  // “猜错了，游戏继续”的弹窗（保持不变）
   void _showGuessResultDialog(bool correct, String feedback) {
     if (Navigator.canPop(context)) {
       Navigator.pop(context); 
@@ -799,45 +817,154 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  // “游戏结束”的弹窗
-  void _showGameOverDialog(bool correct, String feedback) {
+  // “游戏结束”的弹窗（包含排行榜 和 两步弹窗逻辑）
+  void _showGameOverDialog(
+    bool correct, 
+    String feedback, 
+    List<dynamic>? leaderboard,
+    { dynamic guesserId, } 
+  ) async { 
+    
     if (Navigator.canPop(context)) {
       Navigator.pop(context); 
     }
-    showDialog(
-      context: context,
-      barrierDismissible: false, 
-      builder: (_) => AlertDialog(
-        title: Text(correct ? '🎉 推测正确！游戏结束！' : '游戏结束'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(feedback),
-            if (correct)
+
+    final bool iAmTheGuesser = (myId != null && myId == guesserId);
+
+    if (iAmTheGuesser && correct) {
+      
+      // --- 弹窗 1：显示成功信息 ---
+      await showDialog( 
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          title: const Text('🎉 推测正确！'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(feedback),
               const Padding(
                 padding: EdgeInsets.only(top: 10.0),
                 child: Text('+5 分！', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
               ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context), 
+              child: const Text('查看排行榜'),
+            ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context), 
-            child: const Text('知道了'),
+      );
+
+      // --- 弹窗 2：显示排行榜 ---
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          title: const Text('最终排行'),
+          content: SingleChildScrollView(
+            child: (leaderboard != null && leaderboard.isNotEmpty)
+                ? _buildLeaderboardWidget(leaderboard) // 调用文字列表
+                : const Text('暂无排行信息。'),
           ),
-        ],
-      ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context), 
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+
+    } else {
+      // --- 流程 2：其他人 或 主持人停止 ---
+      String title = '游戏结束';
+      if (correct && guesserId != null) {
+        title = '游戏结束 (玩家 $guesserId 猜对了!)';
+      }
+
+      showDialog(
+        context: context,
+        barrierDismissible: false, 
+        builder: (_) => AlertDialog(
+          title: Text(title),
+          content: SingleChildScrollView( 
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(feedback), 
+                
+                if (leaderboard != null && leaderboard.isNotEmpty) ...[
+                  const Divider(height: 24, thickness: 1),
+                  const Text(
+                    '最终排行', 
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+                  ),
+                  const SizedBox(height: 10),
+                  _buildLeaderboardWidget(leaderboard), // 调用文字列表
+                ]
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context), 
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  // 文字列表排行榜 (🥇🥈🥉)
+  Widget _buildLeaderboardWidget(List<dynamic> leaderboard) {
+    if (leaderboard.isEmpty) return const SizedBox.shrink();
+
+    final rankEmojis = ['🥇', '🥈', '🥉'];
+    final widgets = <Widget>[];
+
+    for (int i = 0; i < leaderboard.length; i++) {
+      final item = leaderboard[i] as Map<dynamic, dynamic>?; 
+      if (item == null) continue;
+      
+      final id = item['id'];
+      final score = item['score'];
+      final emoji = (i < rankEmojis.length) ? rankEmojis[i] : '•'; 
+
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4.0),
+          child: Text(
+            '$emoji 玩家 $id: $score 分',
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+          ),
+        ),
+      );
+    }
+    
+    return Column( 
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start, 
+      children: widgets
     );
   }
 
-  // --- (右侧栏函数 _buildRightColumn, _buildOnlinePlayersPanel, _playerTile, _roleOf, _roleColor, _buildBottomControls, _buildScoreControls, _buildOrderChips, _tile 保持不变) ---
+
+  // --- (右侧栏函数) ---
+  
+  // [!! 修改 !!]
+  // 背景色改为半透明
   Widget _buildRightColumn() {
     final progressCard = Container(
       width: double.infinity,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.blue.shade50,
+        color: Colors.blue.shade50.withOpacity(0.9), // [!! 修改 !!]
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.blue.shade100),
       ),
@@ -860,7 +987,7 @@ class _ChatPageState extends State<ChatPage> {
         ? Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: Colors.orange.shade50,
+              color: Colors.orange.shade50.withOpacity(0.9), // [!! 修改 !!]
               borderRadius: BorderRadius.circular(12),
               border: Border.all(color: Colors.orange.shade100),
             ),
@@ -896,7 +1023,7 @@ class _ChatPageState extends State<ChatPage> {
     return Container(
       width: 320,
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: const Color.fromRGBO(255, 255, 255, 0.9), // [!! 修改 !!]
         border: Border(left: BorderSide(color: Colors.grey.shade300)),
       ),
       child: Padding(
@@ -920,11 +1047,13 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  // [!! 修改 !!]
+  // 背景色改为半透明
   Widget _buildOnlinePlayersPanel() {
     final ids = List<int>.from(order)..sort();
     return Container(
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
+        color: const Color.fromRGBO(245, 245, 245, 0.9), // [!! 修改 !!]
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.grey.shade300),
       ),
@@ -1083,7 +1212,7 @@ class _ChatPageState extends State<ChatPage> {
       return Container(
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
-          color: Colors.grey.shade50,
+          color: Colors.grey.shade50.withOpacity(0.9), // [!! 修改 !!]
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: Colors.grey.shade300),
         ),
@@ -1096,7 +1225,7 @@ class _ChatPageState extends State<ChatPage> {
       return Container(
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
-          color: Colors.green.shade50,
+          color: Colors.green.shade50.withOpacity(0.9), // [!! 修改 !!]
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: Colors.green.shade200),
         ),
@@ -1108,7 +1237,7 @@ class _ChatPageState extends State<ChatPage> {
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: Colors.purple.shade50,
+        color: Colors.purple.shade50.withOpacity(0.9), // [!! 修改 !!]
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.purple.shade100),
       ),
@@ -1158,7 +1287,7 @@ class _ChatPageState extends State<ChatPage> {
       if (i != order.length - 1) {
         children.add(Padding(
           padding: const EdgeInsets.only(right: 6, bottom: 6),
-          child: Text('→', style: TextStyle(color: Colors.grey.shade600)),
+          child: Text('→', style: TextStyle(color: Colors.grey.shade300)),
         ));
       }
     }
@@ -1184,16 +1313,39 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  // [!! 修改 !!]
+  // (将 Scaffold 的 body 包裹在一个 Container 中以应用背景)
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('特殊聊天室（三栏）')),
-      body: Row(
-        children: [
-          _buildLeftSidebar(),
-          Expanded(child: _buildCenterColumn()),
-          _buildRightColumn(),
-        ],
+      // [!! 修改 !!]
+      // Scaffold 的背景透明，让 body 的 Container 来处理背景
+      backgroundColor: Colors.transparent, 
+      body: Container(
+        // [!! 新增 !!]
+        // 这个 Container 负责显示背景图
+        decoration: BoxDecoration(
+          image: (_currentBgImgUrl != null && _currentBgImgUrl!.isNotEmpty)
+            ? DecorationImage(
+                // 假设是网络图片
+                image: NetworkImage(_currentBgImgUrl!),
+                fit: BoxFit.cover,
+                // 增加一个暗色滤镜，让UI面板更易读
+                colorFilter: ColorFilter.mode(
+                  Colors.black.withOpacity(0.5), // 50% 黑
+                  BlendMode.darken,
+                ),
+              )
+            : null, // 如果没有URL，则没有背景
+        ),
+        child: Row(
+          children: [
+            _buildLeftSidebar(),
+            Expanded(child: _buildCenterColumn()),
+            _buildRightColumn(),
+          ],
+        ),
       ),
     );
   }

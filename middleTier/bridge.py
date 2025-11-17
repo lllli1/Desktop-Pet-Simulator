@@ -1,15 +1,16 @@
-# bridge.py (V2 最终/生产版 - 已修复 .open Bug)
+# bridge.py (V2.2 - 已添加 final_answer 转发)
 
 import asyncio
 import json
 import logging
 import os
-from typing import Optional
+from typing import Optional, Set
+from contextlib import asynccontextmanager 
 
 import httpx
 import uvicorn
 import websockets
-from websockets.connection import State  # <--- [!! 1. 新增的导入 !!]
+from websockets.connection import State
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -21,13 +22,35 @@ logger = logging.getLogger("bridge")
 SERVER_WS_URL = os.getenv("SERVER_WS_URL", "ws://127.0.0.1:8080")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "http://127.0.0.1:5000")
 RECONNECT_SECONDS = float(os.getenv("RECONNECT_SECONDS", "2.0"))
+PET_WS_PORT = int(os.getenv("PET_WS_PORT", "8011"))
+
+# --- lifespan 函数 ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup (启动时)
+    logger.info("Application starting up...")
+    asyncio.create_task(server_reader_loop())
+    asyncio.create_task(start_pet_ws_server())
+    logger.info("Background tasks created.")
+    
+    yield # 应用在这里运行
+    
+    # Shutdown (关闭时, 可选)
+    logger.info("Application shutting down...")
 
 # --- 3. 全局状态 ---
-app = FastAPI(title="AI Relay Bridge (V2)", version="2.0-final-fix")
+app = FastAPI(
+    title="AI Relay Bridge", 
+    version="2.2-final-forward", 
+    lifespan=lifespan 
+)
 server_ws = None  # type: Optional[websockets.WebSocketClientProtocol]
 server_ws_lock = asyncio.Lock()
 ai_client = httpx.AsyncClient(base_url=AI_BASE_URL, timeout=30.0)
 SERVER_TO_PY_TYPES = {"ai_judge_question", "ai_validate_final_answer"}
+
+pet_clients: Set[websockets.WebSocketServerProtocol] = set() 
+pet_ws_lock = asyncio.Lock()
 
 # --- 4. 核心功能：连接和转发 ---
 
@@ -36,7 +59,6 @@ async def ensure_server_connected():
     global server_ws
     async with server_ws_lock:
         
-        # [!! 2. 修复的行 !!] (原为 .open)
         if server_ws and server_ws.state == State.OPEN:
             return server_ws
         
@@ -58,9 +80,21 @@ async def forward_to_server(message: dict):
         logger.info(f"Sent result to server (type={message.get('type')}, id={message.get('request_id')})")
     except Exception as e:
         logger.error(f"Send to server failed: {e}")
-        # 这里不再 raise，防止一个发送失败导致整个循环崩溃
         logger.error(f"Forward to server failed: {e}")
 
+async def broadcast_to_pets(message: dict):
+    """把消息广播给所有连接的桌宠客户端"""
+    async with pet_ws_lock:
+        if not pet_clients:
+            return
+        
+        json_message = json.dumps(message, ensure_ascii=False)
+        tasks = [client.send(json_message) for client in pet_clients]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for res in results:
+            if isinstance(res, Exception):
+                logger.warning(f"Failed to send message to a pet client: {res}")
 
 # --- 5. 核心功能：调用 AI (app.py) ---
 
@@ -76,6 +110,14 @@ async def call_app_judge_question(task: dict, req_id: str):
         resp = await ai_client.post("/ai/judge_question", json=payload)
         resp.raise_for_status() 
         ai_data = resp.json()
+
+        # (已有的) 转发给桌宠
+        pet_message = ai_data.copy()
+        pet_message['type'] = 'ai_judge_result' 
+        pet_message['request_id'] = req_id      
+        asyncio.create_task(broadcast_to_pets(pet_message))
+        
+        # (已有的) 转发给主服务器
         await forward_to_server({
             "type": "ai_judge_question_result",
             "request_id": req_id,
@@ -83,7 +125,6 @@ async def call_app_judge_question(task: dict, req_id: str):
             "score_result": ai_data.get("score_result"),
         })
     except Exception as e:
-        # 日志中显示更详细的错误
         logger.error(f"Task {req_id} failed in call_app_judge_question: {e}", exc_info=True)
         await forward_to_server({
             "type": "ai_judge_question_result",
@@ -102,6 +143,15 @@ async def call_app_validate_final_answer(task: dict, req_id: str):
         resp = await ai_client.post("/ai/validate_final_answer", json=payload)
         resp.raise_for_status()
         ai_data = resp.json()
+
+        # --- [!! 🔥 新增: 将最终验证结果也转发给桌宠 !!] ---
+        pet_message = ai_data.copy()
+        pet_message['type'] = 'ai_validate_final_result' # (给桌宠一个新的专属类型)
+        pet_message['request_id'] = req_id      
+        asyncio.create_task(broadcast_to_pets(pet_message))
+        # --- [!! 🔥 新增结束 !!] ---
+
+        # (已有的) 转发给主服务器
         await forward_to_server({
             "type": "ai_validate_final_answer_result",
             "request_id": req_id,
@@ -143,21 +193,41 @@ async def server_reader_loop():
                 logger.info(f"Received task from server, type={msg_type}, id={req_id}")
 
                 if msg_type in SERVER_TO_PY_TYPES:
-                    asyncio.create_task(handle_ai_task(msg, req_id, msg_type))
+                    # (已有的) 转发收到的 *任务* 给桌宠
+                    asyncio.create_task(broadcast_to_pets(msg)) 
+                    # (已有的) 处理任务
+                    asyncio.create_task(handle_ai_task(msg, req_id, msg_type)) 
                 
         except Exception as e:
             logger.warning(f"Server WS reader error: {e}. Reconnecting ...")
-            # 在重连前将 server_ws 设为 None，强制 ensure_server_connected 重新连接
             async with server_ws_lock:
                 server_ws = None 
             await asyncio.sleep(RECONNECT_SECONDS)
 
-# --- 7. (V2) 启动事件 [!!! 关键修复 !!!] ---
-@app.on_event("startup")
-async def _startup():
-    asyncio.create_task(server_reader_loop())
+# --- 桌宠 WebSocket 服务器逻辑 ---
+async def handle_pet_client(websocket: websockets.WebSocketServerProtocol):
+    """处理单个桌宠客户端连接"""
+    async with pet_ws_lock:
+        pet_clients.add(websocket)
+    logger.info(f"Pet client connected: {websocket.remote_address}")
+    try:
+        await websocket.wait_closed()
+    finally:
+        async with pet_ws_lock:
+            pet_clients.remove(websocket)
+        logger.info(f"Pet client disconnected: {websocket.remote_address}")
 
-# --- 8. (V2) 保留的测试接口 (与主流程无关) ---
+async def start_pet_ws_server():
+    """启动桌宠专用的 WebSocket 服务器"""
+    logger.info(f"Starting pet WebSocket server on ws://0.0.0.0:{PET_WS_PORT}")
+    try:
+        async with websockets.serve(handle_pet_client, "0.0.0.0", PET_WS_PORT):
+            await asyncio.Future()  # 保持服务运行
+    except Exception as e:
+        logger.error(f"Pet WS server failed: {e}", exc_info=True)
+
+
+# --- 保留的测试接口 ---
 @app.post("/test/http_to_dart")
 async def test_http_to_dart(payload: dict = Body(...)):
     try:
@@ -177,6 +247,6 @@ async def test_http_to_ai():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 9. 启动 ---
+# --- 启动 ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8010)
